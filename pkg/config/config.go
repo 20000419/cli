@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -23,6 +25,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/docker/go-units"
@@ -458,15 +461,14 @@ func (c *config) Eject(w io.Writer) error {
 
 // Loads custom config file to struct fields tagged with toml.
 func (c *config) loadFromFile(filename string, fsys fs.FS) error {
-	v := viper.NewWithOptions(
-		viper.ExperimentalBindStruct(),
-		viper.EnvKeyReplacer(strings.NewReplacer(".", "_")),
-	)
+	v := viper.New()
 	v.SetEnvPrefix("SUPABASE")
-	v.AutomaticEnv()
 	if err := c.mergeDefaultValues(v); err != nil {
 		return err
 	} else if err := mergeFileConfig(v, filename, fsys); err != nil {
+		return err
+	}
+	if err := bindUserConfigEnv(v, reflect.TypeOf(*c), ""); err != nil {
 		return err
 	}
 	// Find [remotes.*] block to override base config
@@ -486,6 +488,62 @@ func (c *config) loadFromFile(filename string, fsys fs.FS) error {
 		}
 	}
 	return c.load(v)
+}
+
+func bindUserConfigEnv(v *viper.Viper, t reflect.Type, prefix string) error {
+	textUnmarshaler := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		if field.Anonymous {
+			if err := bindUserConfigEnv(v, field.Type, prefix); err != nil {
+				return err
+			}
+			continue
+		}
+		if tag := strings.Split(field.Tag.Get("toml"), ",")[0]; tag == "-" {
+			continue
+		}
+		key := strings.Split(field.Tag.Get("json"), ",")[0]
+		if key == "-" {
+			continue
+		} else if key == "" {
+			key = toSnakeCase(field.Name)
+		}
+		if len(prefix) > 0 {
+			key = prefix + "." + key
+		}
+		fieldType := field.Type
+		if fieldType.Kind() == reflect.Ptr {
+			fieldType = fieldType.Elem()
+		}
+		if fieldType.Kind() == reflect.Struct && !fieldType.Implements(textUnmarshaler) && !reflect.PointerTo(fieldType).Implements(textUnmarshaler) {
+			if err := bindUserConfigEnv(v, fieldType, key); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := v.BindEnv(key); err != nil {
+			return errors.Errorf("failed to bind env override for %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func toSnakeCase(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if unicode.IsUpper(r) {
+			if i > 0 {
+				b.WriteByte('_')
+			}
+			r = unicode.ToLower(r)
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func (c *config) mergeDefaultValues(v *viper.Viper) error {
